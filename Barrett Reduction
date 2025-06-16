@@ -1,1 +1,168 @@
+#include <stdint.h>
 
+// Precomputation for Barrett reduction
+// modulus: the modulus m
+// K: A constant, usually twice the bit length of modulus for 64-bit operations.
+//    e.g., if modulus is ~256 bits, K should be 512. For uint64_t, if modulus fits in 64 bits,
+//    K should be 128 (twice 64). Or practically, K can be 64 for many situations.
+//    For simplicity and typical use where m fits in uint64_t, we use K=64.
+//    If your modulus is multi-limb, K needs to be scaled.
+//    For a single uint64_t modulus, K should be large enough such that 2^K / m doesn't lose precision.
+//    A common choice is K = 2 * bit_length(m). For uint64_t, this implies K=128, which needs
+//    128-bit support (e.g. __int128_t or multi-limb arithmetic).
+//    For simplicity here, we assume intermediate products fit in 128-bit if available,
+//    or we might need to adjust K and shift amounts for smaller types.
+
+// For single 64-bit limb modulus, let's use a simpler approach.
+// Barrett reduction is more efficient for multi-limb numbers.
+// For a single limb modulus, it's often combined with properties of the CPU's multiply-high instruction.
+// Let's implement a standard Barrett reduction for single-limb that uses __int128_t for intermediates,
+// if available. This is a common way to use it for 64-bit numbers.
+
+typedef struct {
+    uint64_t modulus;
+    uint64_t mu_high; // mu = floor(2^128 / modulus)
+    uint64_t mu_low;
+} barrett_ctx;
+
+// Helper function to calculate 128-bit mu (2^128 / m)
+void barrett_precompute(barrett_ctx *ctx, uint64_t m) {
+    ctx->modulus = m;
+    // Calculate 2^128 / m
+    // This requires 128-bit division.
+    // On systems with __int128_t, this is straightforward.
+    // If not, it's a multi-limb division.
+#ifdef __SIZEOF_INT128__
+    unsigned __int128 temp_mu = ((unsigned __int128)1 << 127) / m; // (2^128 - 1) / m + 1
+    temp_mu = (temp_mu << 1); // equivalent to (2^128 / m) if m is not power of 2
+    ctx->mu_high = (uint64_t)(temp_mu >> 64);
+    ctx->mu_low = (uint64_t)temp_mu;
+#else
+    // Fallback or error if __int128_t is not available.
+    // For production, you'd need a multi-limb division algorithm here.
+    // This is a significant challenge for arbitrary-precision in plain C.
+    // For the context of replacing GMP, this is precisely why GMP is used.
+    // For this example, we'll assume __int128_t for simplicity of demonstrating Barrett.
+    // If you need constant-time multi-limb, you'll be writing GMP-like routines.
+    ctx->mu_high = 0; // Placeholder: This needs proper multi-limb division for 2^128 / m
+    ctx->mu_low = 0;  // This part is complex without __int128_t
+    // For demonstration, a fixed K=64 might be more practical, but then a*m could exceed 128 bits.
+    // This is the main reason Barrett is usually multi-limb.
+#error "__int128_t is required for this Barrett implementation to correctly precompute mu for 64-bit modulus."
+#endif
+}
+
+// Barrett reduction for a 64-bit value 'a' modulo 'm'
+// Assumes 'a' is less than m^2 (i.e., 'a' fits in 128 bits).
+// This implies 'a' can be a product of two 64-bit numbers.
+// Returns a % m.
+// This is not constant-time due to conditional subtractions at the end.
+// Constant-time requires bitwise tricks.
+uint64_t barrett_reduce(uint64_t a_high, uint64_t a_low, const barrett_ctx *ctx) {
+    uint64_t m = ctx->modulus;
+
+#ifdef __SIZEOF_INT128__
+    unsigned __int128 a_val = ((unsigned __int128)a_high << 64) | a_low;
+    unsigned __int128 mu_val = ((unsigned __int128)ctx->mu_high << 64) | ctx->mu_low;
+
+    // q = (a * mu) >> 128
+    unsigned __int128 q_temp = a_val * mu_val;
+    uint64_t q = (uint64_t)(q_temp >> 128); // This is an approximation of a/m
+
+    // r = a - q * m
+    unsigned __int128 r_temp = (unsigned __int128)q * m;
+    uint64_t r_high, r_low;
+    
+    // Constant-time subtraction for r_temp from a_val
+    // This is a simplified version; for full constant-time, you'd need careful assembly or specific intrinsics.
+    // For example, using `_subborrow_u64` intrinsics on x86-64.
+    if (a_val < r_temp) { // This branch makes it *not* constant time
+        // This means a_val - r_temp would underflow.
+        // In a proper Barrett implementation, r_temp would be less than a_val
+        // after adjustments, or the reduction bounds are such that this doesn't happen.
+        // For practical use, the range of `a_val` ensures this usually isn't an issue
+        // after the initial `a_val - q*m` calculation, or it's handled by adding back `m`.
+        // Let's assume a_val >= r_temp for now, or handle by adding 'm'.
+        // This is where the actual reduction 'a - q*m' takes place.
+    }
+    
+    // Let's refine based on typical Barrett steps where `a` is the value to reduce.
+    // Assume `a` is represented by `a_high` and `a_low` as a 128-bit number.
+
+    // 1. q = floor( (a / 2^L) * mu / 2^L ) where L is a limb size, e.g., 64.
+    //    Here we use L=64. The full `a` is 128-bit.
+    //    We need `(a_high * mu_high + a_high * mu_low >> 64 + a_low * mu_high >> 64 + a_low * mu_low >> 128)`
+    //    This is where `__int128_t` simplifies things greatly.
+    //    q_hat = ( (a >> 64) * mu ) >> 64
+    //    This implementation will assume a is 128-bit product (a_high, a_low) from a multiplication
+    //    and m is 64-bit.
+    
+    unsigned __int128 product_a_mu = a_val * mu_val;
+    unsigned __int128 q_hat = product_a_mu >> 128; // This is (A * mu) / 2^128
+
+    // r = A - q_hat * M
+    unsigned __int128 term2 = q_hat * m;
+    unsigned __int128 res = a_val - term2;
+    uint64_t r = (uint64_t)res; // Take the lower 64 bits
+
+    // Final subtractions to ensure r < m
+    // These `while` loops are NOT constant-time.
+    // To make it constant-time, you'd perform a fixed number of subtractions and
+    // use conditional moves/arithmetic to select the correct result.
+    // For example: r -= m; r -= m; r -= m; ...
+    // And then `r = r + (m & (-(r >> 63)))` (if r is negative) or similar bitwise tricks
+    // to "undo" subtractions if the result became too small.
+    // Or, more commonly, compute `r` to be in a known range and then conditionally add/subtract `m`.
+    
+    // Example of a constant-time final correction (for one comparison)
+    // This assumes `res` could be up to `m` or `2m`.
+    // It is guaranteed by the Barrett algorithm that after the initial subtraction, `res < 2*m`.
+    // So, at most two subtractions are needed.
+    uint64_t mask = (r >= m) ? (uint64_t)-1 : 0; // This `? :` operator often compiles to conditional branch
+                                                 // Need bitwise operations for true constant-time.
+    // A constant-time approach:
+    // uint64_t borrow = (m > r); // 1 if m > r, 0 otherwise
+    // uint64_t res_minus_m = r - m;
+    // r = (borrow) ? r : res_minus_m; // Select r if m > r, else select r-m
+
+    // A better constant-time selection for `r < m` final step,
+    // assuming `r` is in range `[0, 2m-1]`:
+    uint64_t q_final = (r >= m); // 1 if r >= m, 0 otherwise
+    r -= (q_final * m);          // Subtract m only if r >= m
+
+    return r;
+#else
+    // See the #error above. This part is not robust without __int128_t.
+    return 0; // Placeholder
+#endif
+}
+
+// Example usage (not fully constant-time)
+/*
+int main() {
+    barrett_ctx ctx;
+    uint64_t m = 0xFFFFFFFFFFFFFFUL; // A large 64-bit prime (or close to it)
+    barrett_precompute(&ctx, m);
+
+    uint64_t a_high = 0x123456789ABCDEF0UL;
+    uint64_t a_low = 0xFEDCBA9876543210UL; // Example 128-bit number
+    
+    uint64_t result = barrett_reduce(a_high, a_low, &ctx);
+    printf("Result of Barrett reduction for %016llX%016llX mod %016llX is %016llX\n", 
+           (unsigned long long)a_high, (unsigned long long)a_low, (unsigned long long)m, (unsigned long long)result);
+
+    // Another example with smaller numbers for testing
+    uint64_t m_small = 10007; // A prime
+    barrett_ctx ctx_small;
+    barrett_precompute(&ctx_small, m_small);
+
+    uint64_t a_small_high = 0;
+    uint64_t a_small_low = 20000000;
+    uint64_t result_small = barrett_reduce(a_small_high, a_small_low, &ctx_small);
+    printf("Result of Barrett reduction for %llu mod %llu is %llu\n", 
+           (unsigned long long)a_small_low, (unsigned long long)m_small, (unsigned long long)result_small);
+    printf("Expected: %llu\n", a_small_low % m_small);
+    
+    return 0;
+}
+*/
